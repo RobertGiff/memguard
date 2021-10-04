@@ -156,7 +156,6 @@ extern int *g_period_us_ptr;
 extern int (*litmus_throttled_ptr)[NR_CPUS];
 int litmus_throttled[NR_CPUS];
 
-
 /**************************************************************************
  * External Function Prototypes
  **************************************************************************/
@@ -296,7 +295,7 @@ void update_statistics(struct core_info *cinfo)
 		/* used time */
 		exclusive_ns = (TM_NS(ktime_get()) -
 				TM_NS(cinfo->exclusive_time));
-		
+
 		/* used bw */
 		exclusive_bw = (cinfo->used[0] - cinfo->budget);
 
@@ -307,7 +306,7 @@ void update_statistics(struct core_info *cinfo)
 	}
 	DEBUG_PROFILE(pr_info("%lld %d %p CPU%d org: %d cur: %d period: %ld\n",
 				   new, used, cinfo->throttled_task,
-				   smp_processor_id(), 
+				   smp_processor_id(),
 				   cinfo->budget,
 				   cinfo->cur_budget,
 				   (long)cinfo->period_cnt));
