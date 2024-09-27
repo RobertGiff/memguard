@@ -46,6 +46,7 @@
 #include <linux/kthread.h>
 #include <linux/printk.h>
 #include <linux/interrupt.h>
+#include <linux/preempt.h>
 #include <litmus/preempt.h>
 
 void sched_state_will_schedule(struct task_struct* tsk);
@@ -154,7 +155,7 @@ static struct dentry *memguard_dir;
 extern int *g_period_us_ptr;
 
 extern int (*litmus_throttled_ptr)[NR_CPUS];
-int litmus_throttled[NR_CPUS];
+volatile int litmus_throttled[NR_CPUS];
 
 /**************************************************************************
  * External Function Prototypes
@@ -351,6 +352,8 @@ static void __newperiod(void *info)
 	struct memguard_info *global = &memguard_info;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 
+	BUG_ON(smp_processor_id() >= 4);
+
 	ktime_t new_expire = ktime_add(start, global->period_in_ktime);
 
 	/* arrived before timer interrupt is called */
@@ -367,21 +370,25 @@ static void __newperiod(void *info)
  */
 static void memguard_process_overflow(struct irq_work *entry)
 {
-	struct core_info *cinfo = this_cpu_ptr(core_info);
+	struct core_info      *cinfo = this_cpu_ptr(core_info);
 	struct memguard_info *global = &memguard_info;
 	ktime_t start;
 	s64 budget_used;
+	int cpu = smp_processor_id();
 
 	start = ktime_get();
 
 	BUG_ON(in_nmi() || !in_irq());
+	BUG_ON(cpu >= 4);
 
 	//printk("MEMGUARD_PROCESS_OVERFLOW\n");
 
 	budget_used = memguard_event_used(cinfo);
 
-	/* erroneous overflow, that could have happend before period timer
-	   stop the pmu */
+	/**
+	 * erroneous overflow, that could have happend before period timer
+	 * stop the pmu
+	 */
 	if (budget_used < cinfo->cur_budget) {
 		pr_info("ERR: overflow in timer. used %lld < cur_budget %d. ignore\n",
 			     budget_used, cinfo->cur_budget);
@@ -397,7 +404,7 @@ static void memguard_process_overflow(struct irq_work *entry)
 		cinfo->prev_throttle_error = 1;
 	}
 
-	if (!cpumask_test_cpu(smp_processor_id(), global->active_mask)) {
+	if (!cpumask_test_cpu(cpu, global->active_mask)) {
 		pr_info("ERR: not active\n");
 		cinfo->throttled_task = NULL;
 		return;
@@ -406,7 +413,7 @@ static void memguard_process_overflow(struct irq_work *entry)
 	/* we are going to be throttled */
 
 	//preempt_disable();
-	cpumask_set_cpu(smp_processor_id(), global->throttle_mask);
+	cpumask_set_cpu(cpu, global->throttle_mask);
 	//preempt_enable();
 	smp_mb(); // w -> r ordering of the local cpu.
 	if (cpumask_equal(global->throttle_mask, global->active_mask)) {
@@ -456,12 +463,15 @@ static void memguard_process_overflow(struct irq_work *entry)
 	// WARN_ON_ONCE(!strncmp(current->comm, "swapper", 7));
 	//printk("MEMGUARD, WAKEUP THROTTLE THREAD");
 	/* RG: we don't wake it up, it is always awake, instead set flag and let litmus schedule it */
-	BUG_ON(smp_processor_id() >= NR_CPUS);
-	if (litmus_throttled[smp_processor_id()] != -1) {
-		//printk("litmus throttled[%d] @ %lld\n", smp_processor_id(), TM_NS(ktime_get()));
-		litmus_throttled[smp_processor_id()] = 1;
+	BUG_ON(cpu >= NR_CPUS);
+	if (litmus_throttled[cpu] != -1) {
+		//pr_info("LITMUS THROTTLED[%d]\n", smp_processor_id());
+		litmus_throttled[cpu] = 1;
 		set_preempt_need_resched();
 		set_tsk_need_resched(cinfo->throttle_thread);
+		set_tsk_need_resched(current);
+		litmus_reschedule_local();
+		preempt_set_need_resched();
 	}
 	//wake_up_interruptible(&cinfo->throttle_evt);
 }
@@ -477,10 +487,12 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	struct memguard_info *global = &memguard_info;
 	int orun;
+	int cpu = smp_processor_id();
 
 	/* must be irq disabled. hard irq */
 	BUG_ON(!irqs_disabled());
 	WARN_ON_ONCE(!in_interrupt());
+	BUG_ON(cpu >= 4);
 
 	/* stop counter */
 	cinfo->event->pmu->stop(cinfo->event, PERF_EF_UPDATE);
@@ -498,12 +510,14 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 	period_timer_callback_slave(cinfo);
 
 	/* RG: unset our litmus memguard flag */
-	BUG_ON(smp_processor_id() >= NR_CPUS);
-	if (litmus_throttled[smp_processor_id()] == 1) {
+	if (litmus_throttled[cpu] == 1) {
 		//printk("litmus UNthrottled[%d] @ %lld\n", smp_processor_id(), TM_NS(ktime_get()));
-		litmus_throttled[smp_processor_id()] = 0;
+		litmus_throttled[cpu] = 0;
 		set_preempt_need_resched();
 		set_tsk_need_resched(cinfo->throttle_thread);
+		set_tsk_need_resched(current);
+		litmus_reschedule_local();
+		preempt_set_need_resched();
 	}
 
 	return HRTIMER_RESTART;
@@ -523,6 +537,8 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	struct memguard_info *global = &memguard_info;
 	struct task_struct *target;
 	int cpu = smp_processor_id();
+
+	BUG_ON(cpu >= 4);
 
 	/* I'm actively participating */
 	cpumask_clear_cpu(cpu, global->throttle_mask);
@@ -583,6 +599,8 @@ static struct perf_event *init_counter(int cpu, int budget)
 		.exclude_kernel = 1,   /* TODO: 1 mean, no kernel mode counting */
 	};
 
+	BUG_ON(cpu >= 4);
+
 	if (g_hw_counter_id >= 0) {
 		/*
 		   known counters for architecture/platforms
@@ -638,6 +656,8 @@ static void __start_counter(void *info)
 {
 	struct memguard_info *global = &memguard_info;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
+	// not a core we care about
+	if (smp_processor_id() >= 4) return;
 	BUG_ON(!cinfo->event);
 
 	/* initialize hr timer */
@@ -659,6 +679,7 @@ static void __start_counter(void *info)
 static void __stop_counter(void *info)
 {
 	struct core_info *cinfo = this_cpu_ptr(core_info);
+	if (smp_processor_id() >= 4) return;
 	BUG_ON(!cinfo->event);
 
 	/* stop the kthrottle/i */
@@ -753,6 +774,7 @@ static ssize_t memguard_limit_write(struct file *filp,
 	for_each_online_cpu(i) {
 		int input;
 		unsigned long events;
+		if (i >= 4) continue;
 		sscanf(p, "%d", &input);
 		if (input == 0) {
 			pr_err("ERR: CPU%d: input is zero: %s.\n",i, p);
@@ -775,10 +797,14 @@ static ssize_t memguard_limit_write(struct file *filp,
 	return cnt;
 }
 
+extern volatile int exp_started;
 static int memguard_limit_show(struct seq_file *m, void *v)
 {
 	int i, cpu;
 	cpu = get_cpu();
+
+	seq_printf(m, "HIJACK, disabling exp_started\n");
+	exp_started = 0;
 
 	seq_printf(m, "cpu  |budget (MB/s,pct,weight)\n");
 	seq_printf(m, "-------------------------------\n");
@@ -786,6 +812,7 @@ static int memguard_limit_show(struct seq_file *m, void *v)
 	for_each_online_cpu(i) {
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
 		int budget = 0;
+		if (i >= 4) continue;
 		if (cinfo->limit > 0)
 			budget = cinfo->limit;
 
@@ -826,6 +853,7 @@ static int memguard_usage_show(struct seq_file *m, void *v)
 	/* current utilization */
 	for (j = 0; j < 3; j++) {
 		for_each_online_cpu(i) {
+			if (i >= 4) continue;
 			struct core_info *cinfo = per_cpu_ptr(core_info, i);
 			u64 budget, used, util;
 
@@ -841,6 +869,7 @@ static int memguard_usage_show(struct seq_file *m, void *v)
 	/* overall utilization
 	   WARN: assume budget did not changed */
 	for_each_online_cpu(i) {
+		if (i >=  4) continue;
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
 		u64 total_budget, total_used, result;
 
@@ -886,6 +915,8 @@ static int throttle_thread(void *arg)
 	int cpunr = (unsigned long)arg;
 	struct core_info *cinfo = per_cpu_ptr(core_info, cpunr);
 
+	BUG_ON(smp_processor_id() >= 4);
+
 #if LINUX_VERSION_CODE > KERNEL_VERSION(5, 9, 0)
 	printk("WOAH WOAH WOAH SETTING TO FIFO!?\n");
 	BUG_ON(1);
@@ -898,10 +929,10 @@ static int throttle_thread(void *arg)
 		.sched_priority = 0,
 	};
 
-	printk("MEMGUARD THROTTLE THREAD ACTIVE FIRST TIME [%d]\n", cpunr);
+	pr_info("MEMGUARD THROTTLE THREAD ACTIVE FIRST TIME [%d]\n", cpunr);
 	sched_setscheduler(current, SCHED_LITMUS, &param);
 	/* now that we have executed, request a preemption imeddiately. we will be scheduled again during the next overflow */
-	printk("MEMGUARD THREAD THREAD[%d], requesting preemption @ %lld\n", cpunr, TM_NS(ktime_get()));
+	pr_info("MEMGUARD THROTTLE THREAD[%d], requesting preemption @ %lld\n", cpunr, TM_NS(ktime_get()));
 	litmus_reschedule_local();
 #endif
 
@@ -930,9 +961,14 @@ static int throttle_thread(void *arg)
 		      smp_mb();
 		      cpu_relax();
 		      /* TODO: mwait */
+		      //pr_info("SPINNING\n");
+
+		      // make sure we are supposed to be running, otherwise implies
+		      // scheduling error
 		}
 	}
 
+	pr_info("!!!!!!! MEMGUARD THREAD EXIT !!!!!!!\n");
 	DEBUG(pr_info("exit\n"));
 	return 0;
 }
@@ -1027,6 +1063,8 @@ int init_module( void )
 					       cpu_to_node(i),
 					       "kthrottle/%d", i);
 
+		cinfo->throttle_thread->is_mg_thread = 1;
+
 		perf_event_enable(cinfo->event);
 
 		BUG_ON(IS_ERR(cinfo->throttle_thread));
@@ -1056,6 +1094,7 @@ void cleanup_module( void )
 
 	struct memguard_info *global = &memguard_info;
 
+	preempt_disable();
 	get_online_cpus();
 
 	/* stop perf_event counters and timers */
@@ -1064,17 +1103,19 @@ void cleanup_module( void )
 
 	/* destroy perf objects */
 	for_each_online_cpu(i) {
+		if (i >= 4) continue;
 		struct core_info *cinfo = per_cpu_ptr(core_info, i);
 		pr_info("Stopping kthrottle/%d\n", i);
 
-		/* RG: disable litmus flags and set pointers to NULL so litmus doesn't crash */
+		/* RG: disable litmus flags and set pointers to NULL so
+		 * litmus doesn't crash */
 		litmus_throttled[i] = -1; /* set to -1 so that litmus knows to schedule the thread
 					     so it can be killed*/
 		g_period_us_ptr  = NULL;
 		_mg_update_budget = NULL;
 		/* send an interrupt to that core */
-		if (i != smp_processor_id())
-			litmus_reschedule(i);
+		//if (i != smp_processor_id())
+		//	litmus_reschedule(i);
 
 		kthread_stop(cinfo->throttle_thread);
 		perf_event_disable(cinfo->event);
@@ -1094,6 +1135,7 @@ void cleanup_module( void )
 	kfree(g_budget_mb);
 
 	put_online_cpus();
+	preempt_enable();
 	pr_info("module uninstalled successfully\n");
 	return;
 }

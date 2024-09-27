@@ -18,6 +18,7 @@
  **************************************************************************/
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#define DEBUG_LITMUS(x)
 #define DEBUG(x)
 #define DEBUG_RECLAIM(x)
 #define DEBUG_USER(x)
@@ -155,7 +156,6 @@ extern int *g_period_us_ptr;
 
 extern int (*litmus_throttled_ptr)[NR_CPUS];
 int litmus_throttled[NR_CPUS];
-
 
 /**************************************************************************
  * External Function Prototypes
@@ -296,7 +296,7 @@ void update_statistics(struct core_info *cinfo)
 		/* used time */
 		exclusive_ns = (TM_NS(ktime_get()) -
 				TM_NS(cinfo->exclusive_time));
-		
+
 		/* used bw */
 		exclusive_bw = (cinfo->used[0] - cinfo->budget);
 
@@ -307,7 +307,7 @@ void update_statistics(struct core_info *cinfo)
 	}
 	DEBUG_PROFILE(pr_info("%lld %d %p CPU%d org: %d cur: %d period: %ld\n",
 				   new, used, cinfo->throttled_task,
-				   smp_processor_id(), 
+				   smp_processor_id(),
 				   cinfo->budget,
 				   cinfo->cur_budget,
 				   (long)cinfo->period_cnt));
@@ -459,9 +459,10 @@ static void memguard_process_overflow(struct irq_work *entry)
 	/* RG: we don't wake it up, it is always awake, instead set flag and let litmus schedule it */
 	BUG_ON(smp_processor_id() >= NR_CPUS);
 	if (litmus_throttled[smp_processor_id()] != -1) {
-		//printk("litmus throttled[%d] @ %lld\n", smp_processor_id(), TM_NS(ktime_get()));
+		DEBUG_LITMUS(pr_info("litmus throttled[%d] @ %lld, need rescehd on: %s and %s\n", smp_processor_id(), TM_NS(ktime_get()), cinfo->throttle_thread->comm, cinfo->throttled_task->comm));
 		litmus_throttled[smp_processor_id()] = 1;
 		set_preempt_need_resched();
+		set_tsk_need_resched(cinfo->throttled_task);
 		set_tsk_need_resched(cinfo->throttle_thread);
 	}
 	//wake_up_interruptible(&cinfo->throttle_evt);
@@ -501,9 +502,10 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 	/* RG: unset our litmus memguard flag */
 	BUG_ON(smp_processor_id() >= NR_CPUS);
 	if (litmus_throttled[smp_processor_id()] == 1) {
-		//printk("litmus UNthrottled[%d] @ %lld\n", smp_processor_id(), TM_NS(ktime_get()));
+		DEBUG_LITMUS(pr_info("litmus UNthrottled[%d] @ %lld\n", smp_processor_id(), TM_NS(ktime_get())));
 		litmus_throttled[smp_processor_id()] = 0;
 		set_preempt_need_resched();
+		//set_tsk_need_resched(cinfo->throttled_task);
 		set_tsk_need_resched(cinfo->throttle_thread);
 	}
 
@@ -768,7 +770,7 @@ static ssize_t memguard_limit_write(struct file *filp,
 			events, input, (use_mb)?"MB/s": "events");
 		smp_call_function_single(i, __update_budget,
 					 (void *)events, 0);
-		
+
 		p = strchr(p, ' ');
 		if (!p) break;
 		p++;
