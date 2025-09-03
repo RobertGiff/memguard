@@ -42,7 +42,6 @@
 #include <linux/kthread.h>
 #include <linux/printk.h>
 #include <linux/interrupt.h>
-#include <asm/cputype.h>
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(5, 0, 0)
 #  include <uapi/linux/sched/types.h>
@@ -51,6 +50,7 @@
 #elif LINUX_VERSION_CODE > KERNEL_VERSION(3, 8, 0)
 #  include <linux/sched/rt.h>
 #endif
+
 #include <linux/sched.h>
 
 /**************************************************************************
@@ -383,6 +383,10 @@ static void event_overflow_callback(struct perf_event *event,
 {
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	BUG_ON(!cinfo);
+
+	/* gate the deadline scheduler so it can't run */
+	//pr_info("DISABLE SCHED_DEADLINE ON CPU: %d\n", smp_processor_id());
+	sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
 	irq_work_queue(&cinfo->read_pending);
 }
 
@@ -395,6 +399,9 @@ static void event_write_overflow_callback(struct perf_event *event,
 {
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	BUG_ON(!cinfo);
+	
+	//pr_info("DISABLE SCHED_DEADLINE ON CPU: %d\n", smp_processor_id());
+	sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
 	irq_work_queue(&cinfo->write_pending);
 }
 
@@ -424,7 +431,7 @@ static void __newperiod(void *info)
 
 	/* arrived before timer interrupt is called */
 	hrtimer_start_range_ns(&cinfo->hr_timer, new_expire,
-			       0, HRTIMER_MODE_ABS_PINNED);
+			       0, HRTIMER_MODE_ABS_PINNED | HRTIMER_MODE_HARD);
 
 	DEBUG(trace_printk("begin new period\n"));
 	period_timer_callback_slave(cinfo);
@@ -441,9 +448,14 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 	ktime_t start;
 	s64 read_budget_used;//, write_budget_used;
 
+	unsigned long flags;
+	local_irq_save(flags);
+	preempt_disable();
+
 	start = ktime_get();
 
-	BUG_ON(in_nmi() || !in_irq());
+	//BUG_ON(!in_irq()); not true anymore in new linux
+	BUG_ON(in_nmi());
 
 	read_budget_used = memguard_read_event_used(cinfo);
 
@@ -452,6 +464,8 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 	if (read_budget_used < cinfo->cur_read_budget) {
 		trace_printk("ERR: used %lld < cur_budget %d. ignore\n",
 			     read_budget_used, cinfo->cur_read_budget);
+		preempt_enable();
+		local_irq_restore(flags);
 		return;
 	}
 
@@ -464,6 +478,8 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 			local64_set(&cinfo->read_event->hw.period_left, amount);
 			DEBUG_RECLAIM(trace_printk("locally reclaimed %d\n",
 						   amount));
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		}
 		/* try to reclaim from the global pool */
@@ -485,6 +501,8 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 			local64_set(&cinfo->read_event->hw.period_left, amount);
 			DEBUG_RECLAIM(trace_printk("globally reclaimed %d\n",
 						   amount));
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		}
 	}
@@ -501,6 +519,8 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 	if (!cpumask_test_cpu(smp_processor_id(), global->active_mask)) {
 		trace_printk("ERR: not active\n");
 		cinfo->throttled_task = NULL;
+		preempt_enable();
+		local_irq_restore(flags);
 		return;
 	}
 	/* we are going to be throttled */
@@ -511,33 +531,51 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 		if (g_use_exclusive == 2) {
 			/* SP: wakeup all (no regulation until next period) */
 			memguard_on_each_cpu_mask(global->throttle_mask, __unthrottle_core, NULL, 0);
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		} else if (g_use_exclusive == 5) {
 			/* PS: begin a new period */
 			memguard_on_each_cpu_mask(global->active_mask, __newperiod, NULL, 0);
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		} else if (g_use_exclusive > 5) {
 			trace_printk("ERR: Unsupported exclusive mode %d\n", 
 				     g_use_exclusive);
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		} else if (g_use_exclusive != 0 &&
 			   cpumask_weight(global->active_mask) == 1) {
 			trace_printk("ERR: don't throttle one active core\n");
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		}
 	}
 
-	if (cinfo->prev_read_throttle_error)
+	if (cinfo->prev_read_throttle_error) {
+		preempt_enable();
+		local_irq_restore(flags);
 		return;
+	}
 	/*
 	 * fail to reclaim. now throttle this core
 	 */
 	DEBUG_RECLAIM(trace_printk("fail to reclaim after %lld nsec. throttle %s\n",
 				   TM_NS(ktime_get()) - TM_NS(start), current->comm));
 
+	/* gate the deadline scheduler so it can't run */
+	//pr_info("DISABLE SCHED_DEADLINE ON CPU: %d\n", smp_processor_id());
+	//sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
+
 	/* wake-up throttle task */
 	cinfo->throttled_task = current;
 	cinfo->throttled_time = start;
+
+	preempt_enable();
+	local_irq_restore(flags);
 
 	// WARN_ON_ONCE(!strncmp(current->comm, "swapper", 7));
 	wake_up_interruptible(&cinfo->throttle_evt);
@@ -551,9 +589,14 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 	ktime_t start;
 	s64 write_budget_used;
 
+	unsigned long flags;
+	local_irq_save(flags);
+	preempt_disable();
+
 	start = ktime_get();
 
-	BUG_ON(in_nmi() || !in_irq());
+	//BUG_ON(!in_irq()); not true anymore in new linux
+	BUG_ON(in_nmi());
     
 	write_budget_used = memguard_write_event_used(cinfo);
     
@@ -561,6 +604,8 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 	{
 		trace_printk("ERR: overflow in write timer. used %lld < cur_budget %d. ignore\n",
 			     write_budget_used, cinfo->cur_write_budget);
+		preempt_enable();
+		local_irq_restore(flags);
 		return;
 	}
 
@@ -573,6 +618,8 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 			local64_set(&cinfo->write_event->hw.period_left, amount);
 			DEBUG_RECLAIM(trace_printk("locally reclaimed %d\n",
 						   amount));
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		}
 		/* try to reclaim from the global pool */
@@ -594,6 +641,8 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 			local64_set(&cinfo->write_event->hw.period_left, amount);
 			DEBUG_RECLAIM(trace_printk("globally reclaimed %d\n",
 						   amount));
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		}
 	}
@@ -608,6 +657,8 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 	if (!cpumask_test_cpu(smp_processor_id(), global->active_mask)) {
 		trace_printk("ERR: not active\n");
 		cinfo->throttled_task = NULL;
+		preempt_enable();
+		local_irq_restore(flags);
 		return;
 	}
 
@@ -617,30 +668,49 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 		if (g_use_exclusive == 2) {
 			/* SP: wakeup all (no regulation until next period) */
 			memguard_on_each_cpu_mask(global->throttle_mask, __unthrottle_core, NULL, 0);
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		} else if (g_use_exclusive == 5) {
 			/* PS: begin a new period */
 			memguard_on_each_cpu_mask(global->active_mask, __newperiod, NULL, 0);
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		} else if (g_use_exclusive > 5) {
 			trace_printk("ERR: Unsupported exclusive mode %d\n", 
 				     g_use_exclusive);
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		} else if (g_use_exclusive != 0 &&
 			   cpumask_weight(global->active_mask) == 1) {
 			trace_printk("ERR: don't throttle one active core\n");
+			preempt_enable();
+			local_irq_restore(flags);
 			return;
 		}
 	}
 
-	if (cinfo->prev_write_throttle_error)
+	if (cinfo->prev_write_throttle_error) {
+		preempt_enable();
+		local_irq_restore(flags);
 		return;
+	}
 	
 	DEBUG_RECLAIM(trace_printk("fail to reclaim after %lld nsec. throttle %s\n",
 				   TM_NS(ktime_get()) - TM_NS(start), current->comm));
 
+	/* gate the deadline scheduler so it can't run */
+	//pr_info("DISABLE SCHED_DEADLINE ON CPU: %d\n", smp_processor_id());
+	//sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
+
+	/* wake-up throttle task */
 	cinfo->throttled_task = current;
 	cinfo->throttled_time = start;
+
+	preempt_enable();
+	local_irq_restore(flags);
 
 	// WARN_ON_ONCE(!strncmp(current->comm, "swapper", 7));
 	wake_up_interruptible(&cinfo->throttle_evt);
@@ -657,10 +727,15 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	struct memguard_info *global = &memguard_info;
 	int orun;
+	unsigned long flags;
+
+	// RG: needed now in the RT_PATCH kernel version
+	local_irq_save(flags); // disable hardawre interrupts
+	preempt_disable(); // disable scheduling preemption
 
 	/* must be irq disabled. hard irq */
 	BUG_ON(!irqs_disabled());
-	// WARN_ON_ONCE(!in_interrupt());
+	//WARN_ON_ONCE(!in_interrupt());
 
 	/* stop counter */
 	cinfo->read_event->pmu->stop(cinfo->read_event, PERF_EF_UPDATE);
@@ -677,6 +752,9 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 	cinfo->period_cnt += orun;
 
 	period_timer_callback_slave(cinfo);
+
+	preempt_enable();
+	local_irq_restore(flags);
 
 	return HRTIMER_RESTART;
 }
@@ -749,6 +827,9 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	/* enable performance counter */
 	cinfo->read_event->pmu->start(cinfo->read_event, PERF_EF_RELOAD);
 	cinfo->write_event->pmu->start(cinfo->write_event, PERF_EF_RELOAD);
+
+	/* enable deadline scheduler to run */
+	sched_dl_gate_set_cpu_hard(smp_processor_id(), false);
 }
 
 static struct perf_event *init_counter(int cpu, int budget, int counter_id, void *callback)
@@ -804,12 +885,12 @@ static void __start_counter(void *info)
 
 
 	/* initialize hr timer */
-        hrtimer_init(&cinfo->hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+        hrtimer_init(&cinfo->hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED | HRTIMER_MODE_HARD);
         cinfo->hr_timer.function = &period_timer_callback_master;
 
 	/* start timer */
         hrtimer_start(&cinfo->hr_timer, global->period_in_ktime,
-                      HRTIMER_MODE_REL_PINNED);
+                      HRTIMER_MODE_REL_PINNED | HRTIMER_MODE_HARD);
 
 	/* initialize */
 	cinfo->throttled_task = NULL;
@@ -1189,7 +1270,7 @@ static int throttle_thread(void *arg)
 
 int init_module( void )
 {
-	int i;
+	int i, cpu;
 
 	struct memguard_info *global = &memguard_info;
 
@@ -1209,16 +1290,16 @@ int init_module( void )
 
 	pr_info("NR_CPUS: %d, online: %d\n", NR_CPUS, num_online_cpus());
 
-#if defined(__arm__) || defined(__aarch64__)
-	/* check if we are running on ARM */
-	u32 cpu_id = (u32)read_cpuid_id();
-	u32 cpu_part = (cpu_id >> 4) & 0xFFF;
-	if (cpu_part == 0xD0B || cpu_part == 0xD42) { // Cortex-A76/A78
-		pr_info("Cortex-A76/A78 detected\n");
-		g_read_counter_id = 0x002A;
-		g_write_counter_id = 0x002C; // didn't work on cortex-a76
-	}
-#endif
+//#if defined(__arm__) || defined(__aarch64__)
+//	/* check if we are running on ARM */
+//	u32 cpu_id = (u32)read_cpuid_id();
+//	u32 cpu_part = (cpu_id >> 4) & 0xFFF;
+//	if (cpu_part == 0xD0B || cpu_part == 0xD42) { // Cortex-A76/A78
+//		pr_info("Cortex-A76/A78 detected\n");
+//		g_read_counter_id = 0x002A;
+//		g_write_counter_id = 0x002C; // didn't work on cortex-a76
+//	}
+//#endif
 	if (g_read_counter_id >= 0)
 		pr_info("RAW HW READ COUNTER ID: 0x%x\n", g_read_counter_id);
 	if (g_write_counter_id >= 0)
@@ -1278,7 +1359,9 @@ int init_module( void )
 		memset(cinfo->overall.throttled_error_dist, 0, sizeof(int)*10);
 		cinfo->throttled_time = ktime_set(0,0);
 
-		print_core_info(smp_processor_id(), cinfo);
+		cpu = get_cpu();
+		print_core_info(cpu, cinfo);
+		put_cpu();
 
 		/* initialize nmi irq_work_queue */
 		init_irq_work(&cinfo->read_pending, memguard_read_process_overflow);

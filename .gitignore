@@ -1,3 +1,6 @@
 *.cmd
 *.o
 *.ko
+
+memguard_test_deadline
+memguard_test_normal
