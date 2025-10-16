@@ -227,11 +227,13 @@ static void memguard_on_each_cpu_mask(const struct cpumask *mask,
 }
 
 /** convert MB/s to #of events (i.e., LLC miss counts) per 1ms */
-static inline u64 convert_mb_to_events(int mb)
+inline u64 convert_mb_to_events(int mb)
 {
 	return div64_u64((u64)mb*1024*1024,
 			 CACHE_LINE_SIZE * (1000000/g_period_us));
 }
+EXPORT_SYMBOL(convert_mb_to_events);
+
 static inline int convert_events_to_mb(u64 events)
 {
 	int divisor = g_period_us*1024*1024;
@@ -1000,6 +1002,15 @@ static void __update_write_budget(void *info)
 				smp_processor_id(), cinfo->write_budget));
 
 }
+
+void mg_update_budget(void *info);
+
+void mg_update_budget(void *info) { 
+	__update_write_budget(info);
+	return __update_budget(info);
+}
+EXPORT_SYMBOL(mg_update_budget);
+
 static ssize_t memguard_read_limit_write(struct file *filp,
 				    const char __user *ubuf,
 				    size_t cnt, loff_t *ppos)
