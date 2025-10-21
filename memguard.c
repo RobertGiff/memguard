@@ -986,7 +986,6 @@ static void __update_budget(void *info)
 	cinfo->read_limit = (unsigned long)info;
 	DEBUG_USER(trace_printk("MSG: New read budget of Core%d is %d\n",
 				smp_processor_id(), cinfo->read_budget));
-
 }
 
 static void __update_write_budget(void *info)
@@ -1000,7 +999,6 @@ static void __update_write_budget(void *info)
 	cinfo->write_limit = (unsigned long)info;
 	DEBUG_USER(trace_printk("MSG: New write budget of Core%d is %d\n",
 				smp_processor_id(), cinfo->write_budget));
-
 }
 
 void mg_update_budget(void *info);
