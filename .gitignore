@@ -4,3 +4,9 @@
 
 memguard_test_deadline
 memguard_test_normal
+
+.memguard.o.d
+Module.symvers
+memguard.mod
+memguard.mod.c
+modules.order
