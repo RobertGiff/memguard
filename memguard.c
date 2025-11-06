@@ -42,6 +42,7 @@
 #include <linux/kthread.h>
 #include <linux/printk.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(5, 0, 0)
 #  include <uapi/linux/sched/types.h>
@@ -362,13 +363,13 @@ static void update_statistics(struct core_info *cinfo)
 		cinfo->exclusive_mode = 0;
 		cinfo->overall.exclusive++;
 	}
-	DEBUG_PROFILE(trace_printk("used: %d %d read: %d %d write: %d %d period: %ld\n",
-				   read_used, write_used,
-				   cinfo->read_budget,
-				   cinfo->cur_read_budget,
-				   cinfo->write_budget,
-				   cinfo->cur_write_budget,
-				   (long) cinfo->period_cnt));
+	//DEBUG_PROFILE(trace_printk("used: %d %d read: %d %d write: %d %d period: %ld\n",
+	//			   read_used, write_used,
+	//			   cinfo->read_budget,
+	//			   cinfo->cur_read_budget,
+	//			   cinfo->write_budget,
+	//			   cinfo->cur_write_budget,
+	//			   (long) cinfo->period_cnt));
 }
 
 
@@ -385,6 +386,10 @@ static void event_overflow_callback(struct perf_event *event,
 {
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	BUG_ON(!cinfo);
+
+	//trace_printk("pmu ovf: cpu=%d hard=%d nmi=%d soft=%d curr=%s/%d pol=%d\n",
+	//	     smp_processor_id(), in_hardirq(), in_nmi(), in_serving_softirq(),
+	//	     current->comm, current->pid, current->policy);
 
 	/* gate the deadline scheduler so it can't run */
 	//pr_info("DISABLE SCHED_DEADLINE ON CPU: %d\n", smp_processor_id());
@@ -403,6 +408,10 @@ static void event_write_overflow_callback(struct perf_event *event,
 	BUG_ON(!cinfo);
 	
 	//pr_info("DISABLE SCHED_DEADLINE ON CPU: %d\n", smp_processor_id());
+	//trace_printk("pmu ovf wr: cpu=%d hard=%d nmi=%d soft=%d curr=%s/%d pol=%d\n",
+	//	     smp_processor_id(), in_hardirq(), in_nmi(), in_serving_softirq(),
+	//	     current->comm, current->pid, current->policy);
+
 	sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
 	irq_work_queue(&cinfo->write_pending);
 }
@@ -421,6 +430,8 @@ static void __unthrottle_core(void *info)
 		cinfo->throttled_task = NULL;
 		DEBUG_RECLAIM(trace_printk("exclusive mode begin\n"));
 	}
+	/* Allow SCHED_DEADLINE tasks again once throttle period ends. */
+	sched_dl_gate_set_cpu_hard(smp_processor_id(), false);
 }
 
 static void __newperiod(void *info)
@@ -449,10 +460,17 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 	struct memguard_info *global = &memguard_info;
 	ktime_t start;
 	s64 read_budget_used;//, write_budget_used;
+	
+	//trace_printk("overflow: hard=%d soft=%d curr=%s/%d pol=%d\n",
+	//	     in_hardirq(), in_serving_softirq(), current->comm,
+	//	     current->pid, current->policy);
 
 	unsigned long flags;
 	local_irq_save(flags);
 	preempt_disable();
+
+	/* Make sure the DL gate stays asserted until the throttler runs. */
+	sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
 
 	start = ktime_get();
 
@@ -576,11 +594,13 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 	cinfo->throttled_task = current;
 	cinfo->throttled_time = start;
 
+	/* Wake the throttling kthread before we drop the gate or re-enable IRQs. */
+	wake_up_interruptible(&cinfo->throttle_evt);
+
 	preempt_enable();
 	local_irq_restore(flags);
 
 	// WARN_ON_ONCE(!strncmp(current->comm, "swapper", 7));
-	wake_up_interruptible(&cinfo->throttle_evt);
 }
 
 
@@ -591,9 +611,16 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 	ktime_t start;
 	s64 write_budget_used;
 
+	//trace_printk("overflow: hard=%d soft=%d curr=%s/%d pol=%d\n",
+	//	     in_hardirq(), in_serving_softirq(), current->comm,
+	//	     current->pid, current->policy);
+
 	unsigned long flags;
 	local_irq_save(flags);
 	preempt_disable();
+
+	/* Make sure the DL gate stays asserted until the throttler runs. */
+	sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
 
 	start = ktime_get();
 
@@ -711,11 +738,16 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 	cinfo->throttled_task = current;
 	cinfo->throttled_time = start;
 
+	///* Make sure the DL gate stays asserted until the throttler runs. */
+	//sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
+
+	/* Wake the throttling kthread before we drop the gate or re-enable IRQs. */
+	wake_up_interruptible(&cinfo->throttle_evt);
+
 	preempt_enable();
 	local_irq_restore(flags);
 
 	// WARN_ON_ONCE(!strncmp(current->comm, "swapper", 7));
-	wake_up_interruptible(&cinfo->throttle_evt);
 }
 
 /**
@@ -830,7 +862,6 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	cinfo->read_event->pmu->start(cinfo->read_event, PERF_EF_RELOAD);
 	cinfo->write_event->pmu->start(cinfo->write_event, PERF_EF_RELOAD);
 
-	/* enable deadline scheduler to run */
 	sched_dl_gate_set_cpu_hard(smp_processor_id(), false);
 }
 
@@ -918,6 +949,9 @@ static void __stop_counter(void *info)
 
 	/* stop timer */
 	hrtimer_cancel(&cinfo->hr_timer);
+
+	/* Ensure DL gate is open when stopping the controller. */
+	sched_dl_gate_set_cpu_hard(smp_processor_id(), false);
 }
 
 
@@ -1265,8 +1299,7 @@ static int throttle_thread(void *arg)
 		if (kthread_should_stop())
 			break;
 
-		while (cinfo->throttled_task && !kthread_should_stop())
-		{
+		while (cinfo->throttled_task && !kthread_should_stop()) {
 			smp_mb();
 			cpu_relax();
 			/* TODO: mwait */
@@ -1373,8 +1406,14 @@ int init_module( void )
 		put_cpu();
 
 		/* initialize nmi irq_work_queue */
+#ifdef IRQ_WORK_INIT_HARD
+		/* Run overflow handlers from hard IRQ context when possible. */
+		cinfo->read_pending = IRQ_WORK_INIT_HARD(memguard_read_process_overflow);
+		cinfo->write_pending = IRQ_WORK_INIT_HARD(memguard_write_process_overflow);
+#else
 		init_irq_work(&cinfo->read_pending, memguard_read_process_overflow);
-        	init_irq_work(&cinfo->write_pending, memguard_write_process_overflow);
+		init_irq_work(&cinfo->write_pending, memguard_write_process_overflow);
+#endif
 
 		/* create and wake-up throttle threads */
 		cinfo->throttle_thread =
