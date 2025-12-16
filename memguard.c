@@ -133,6 +133,8 @@ struct core_info {
 
 	struct irq_work write_pending;   /* delayed work for NMIs */
 	struct perf_event *write_event;  /* PMC: LLC writebacks */
+
+	struct irq_work throttle_wake_work; /* defer throttle wakeup out of hardirq */
     
 	struct task_struct *throttle_thread;  /* forced throttle idle thread */
 	wait_queue_head_t throttle_evt; /* throttle wait queue */
@@ -189,6 +191,7 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer);
 static void memguard_read_process_overflow(struct irq_work *entry);
 static void memguard_write_process_overflow(struct irq_work *entry);    
 static int throttle_thread(void *arg);
+static void memguard_throttle_wake(struct irq_work *entry);
 static void memguard_on_each_cpu_mask(const struct cpumask *mask,
 				      smp_call_func_t func,
 				      void *info, bool wait);
@@ -417,6 +420,14 @@ static void event_write_overflow_callback(struct perf_event *event,
 }
 
 
+static void memguard_throttle_wake(struct irq_work *entry)
+{
+	struct core_info *cinfo =
+		container_of(entry, struct core_info, throttle_wake_work);
+
+	wake_up_interruptible(&cinfo->throttle_evt);
+}
+
 /**
  * called by process_overflow
  */
@@ -594,11 +605,12 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 	cinfo->throttled_task = current;
 	cinfo->throttled_time = start;
 
-	/* Wake the throttling kthread before we drop the gate or re-enable IRQs. */
-	wake_up_interruptible(&cinfo->throttle_evt);
-
+	/* Drop atomic context before deferring the wake. */
 	preempt_enable();
 	local_irq_restore(flags);
+
+	/* Run the waitqueue wake-up from non hard-IRQ context. */
+	irq_work_queue(&cinfo->throttle_wake_work);
 
 	// WARN_ON_ONCE(!strncmp(current->comm, "swapper", 7));
 }
@@ -741,11 +753,12 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 	///* Make sure the DL gate stays asserted until the throttler runs. */
 	//sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
 
-	/* Wake the throttling kthread before we drop the gate or re-enable IRQs. */
-	wake_up_interruptible(&cinfo->throttle_evt);
-
+	/* Drop atomic context before deferring the wake. */
 	preempt_enable();
 	local_irq_restore(flags);
+
+	/* Run the waitqueue wake-up from non hard-IRQ context. */
+	irq_work_queue(&cinfo->throttle_wake_work);
 
 	// WARN_ON_ONCE(!strncmp(current->comm, "swapper", 7));
 }
@@ -1414,6 +1427,7 @@ int init_module( void )
 		init_irq_work(&cinfo->read_pending, memguard_read_process_overflow);
 		init_irq_work(&cinfo->write_pending, memguard_write_process_overflow);
 #endif
+		init_irq_work(&cinfo->throttle_wake_work, memguard_throttle_wake);
 
 		/* create and wake-up throttle threads */
 		cinfo->throttle_thread =
