@@ -146,6 +146,7 @@ struct core_info {
 	int64_t period_cnt;      /* active periods count */
 
 	int rtcore;              /* never throttle an rt core */
+	int dl_gate_closed;      /* current DL gate state on this CPU */
 	/* per-core hr timer */
 	struct hrtimer hr_timer;
 };
@@ -172,11 +173,94 @@ static int g_write_budget_mb = DEFAULT_WR_BUDGET_MB;
 static int g_use_reclaim = 0;   /* 1 - enable reclaim of "guaranteed" bw */
 static int g_use_exclusive = 0; /* 2 - spare bw sharing (rtas'13) 
 				   5 - propotional sharing (tc'15) */
+/* DEBUG/EXPERIMENT switch: disable write-side throttling path when set to 0. */
+static int g_enable_write_throttle = 1;
+/*
+ * Edge-triggered DL gating policy:
+ *   0 = legacy behavior (call gate helper on every request)
+ *   1 = stateful behavior (only transition when requested state changes)
+ */
+static int g_edge_trigger_dl_gate = 0;
 static int g_qmin = INT_MAX;
 static int g_read_counter_id = PMU_LLC_MISS_COUNTER_ID;
 static int g_write_counter_id = PMU_LLC_WB_COUNTER_ID; 
 
 static struct dentry *memguard_dir;
+
+/*
+ * DEBUG INSTRUMENTATION (easy to remove later)
+ * ---------------------------------------------
+ * Set MEMGUARD_DEBUG_COUNTERS to 0 to compile out all debug counters.
+ * Runtime stats are available at: /sys/kernel/debug/memguard/debug_stats
+ * Write "reset" to that file to clear counters.
+ */
+#define MEMGUARD_DEBUG_COUNTERS 1
+
+#if MEMGUARD_DEBUG_COUNTERS
+static atomic64_t mg_dbg_gate_on_count;
+static atomic64_t mg_dbg_gate_off_count;
+static atomic64_t mg_dbg_ovf_read_irq_count;
+static atomic64_t mg_dbg_ovf_write_irq_count;
+static atomic64_t mg_dbg_ovf_read_work_count;
+static atomic64_t mg_dbg_ovf_write_work_count;
+static atomic64_t mg_dbg_throttle_wake_count;
+
+static inline void mg_dbg_reset_counters(void)
+{
+	atomic64_set(&mg_dbg_gate_on_count, 0);
+	atomic64_set(&mg_dbg_gate_off_count, 0);
+	atomic64_set(&mg_dbg_ovf_read_irq_count, 0);
+	atomic64_set(&mg_dbg_ovf_write_irq_count, 0);
+	atomic64_set(&mg_dbg_ovf_read_work_count, 0);
+	atomic64_set(&mg_dbg_ovf_write_work_count, 0);
+	atomic64_set(&mg_dbg_throttle_wake_count, 0);
+}
+
+static inline void mg_set_dl_gate(bool closed)
+{
+	struct core_info *cinfo;
+
+	if (unlikely(!core_info)) {
+		if (closed)
+			atomic64_inc(&mg_dbg_gate_on_count);
+		else
+			atomic64_inc(&mg_dbg_gate_off_count);
+		sched_dl_gate_set_cpu_hard(smp_processor_id(), closed);
+		return;
+	}
+
+	cinfo = this_cpu_ptr(core_info);
+	if (g_edge_trigger_dl_gate && cinfo->dl_gate_closed == (int)closed)
+		return;
+
+	if (closed)
+		atomic64_inc(&mg_dbg_gate_on_count);
+	else
+		atomic64_inc(&mg_dbg_gate_off_count);
+
+	sched_dl_gate_set_cpu_hard(smp_processor_id(), closed);
+	cinfo->dl_gate_closed = closed ? 1 : 0;
+}
+#else
+static inline void mg_dbg_reset_counters(void) {}
+
+static inline void mg_set_dl_gate(bool closed)
+{
+	struct core_info *cinfo;
+
+	if (unlikely(!core_info)) {
+		sched_dl_gate_set_cpu_hard(smp_processor_id(), closed);
+		return;
+	}
+
+	cinfo = this_cpu_ptr(core_info);
+	if (g_edge_trigger_dl_gate && cinfo->dl_gate_closed == (int)closed)
+		return;
+
+	sched_dl_gate_set_cpu_hard(smp_processor_id(), closed);
+	cinfo->dl_gate_closed = closed ? 1 : 0;
+}
+#endif
 
 
 /**************************************************************************
@@ -215,6 +299,12 @@ module_param(g_read_budget_mb, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_read_budget_mb, "default read budget in MB/s");
 module_param(g_write_budget_mb, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(g_write_budget_mb, "default write budget in MB/s");
+module_param(g_enable_write_throttle, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_enable_write_throttle,
+		 "Enable write-side MemGuard throttling/gating path (1=on, 0=off)");
+module_param(g_edge_trigger_dl_gate, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(g_edge_trigger_dl_gate,
+		 "Use edge-triggered DL gate transitions (1=on, 0=legacy)");
 /**************************************************************************
  * Module main code
  **************************************************************************/
@@ -394,9 +484,13 @@ static void event_overflow_callback(struct perf_event *event,
 	//	     smp_processor_id(), in_hardirq(), in_nmi(), in_serving_softirq(),
 	//	     current->comm, current->pid, current->policy);
 
+#if MEMGUARD_DEBUG_COUNTERS
+	atomic64_inc(&mg_dbg_ovf_read_irq_count);
+#endif
+
 	/* gate the deadline scheduler so it can't run */
 	//pr_info("DISABLE SCHED_DEADLINE ON CPU: %d\n", smp_processor_id());
-	sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
+	mg_set_dl_gate(true);
 	irq_work_queue(&cinfo->read_pending);
 }
 
@@ -415,7 +509,21 @@ static void event_write_overflow_callback(struct perf_event *event,
 	//	     smp_processor_id(), in_hardirq(), in_nmi(), in_serving_softirq(),
 	//	     current->comm, current->pid, current->policy);
 
-	sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
+#if MEMGUARD_DEBUG_COUNTERS
+	atomic64_inc(&mg_dbg_ovf_write_irq_count);
+#endif
+
+	if (!g_enable_write_throttle) {
+		/*
+		 * DEBUG/EXPERIMENT MODE:
+		 * Ignore write-side throttle path and suppress repeated IRQ storms
+		 * until next period callback reloads period_left.
+		 */
+		local64_set(&cinfo->write_event->hw.period_left, 0xfffffff);
+		return;
+	}
+
+	mg_set_dl_gate(true);
 	irq_work_queue(&cinfo->write_pending);
 }
 
@@ -424,6 +532,10 @@ static void memguard_throttle_wake(struct irq_work *entry)
 {
 	struct core_info *cinfo =
 		container_of(entry, struct core_info, throttle_wake_work);
+
+#if MEMGUARD_DEBUG_COUNTERS
+	atomic64_inc(&mg_dbg_throttle_wake_count);
+#endif
 
 	wake_up_interruptible(&cinfo->throttle_evt);
 }
@@ -442,7 +554,7 @@ static void __unthrottle_core(void *info)
 		DEBUG_RECLAIM(trace_printk("exclusive mode begin\n"));
 	}
 	/* Allow SCHED_DEADLINE tasks again once throttle period ends. */
-	sched_dl_gate_set_cpu_hard(smp_processor_id(), false);
+	mg_set_dl_gate(false);
 }
 
 static void __newperiod(void *info)
@@ -480,8 +592,12 @@ static void memguard_read_process_overflow(struct irq_work *entry)
 	local_irq_save(flags);
 	preempt_disable();
 
+#if MEMGUARD_DEBUG_COUNTERS
+	atomic64_inc(&mg_dbg_ovf_read_work_count);
+#endif
+
 	/* Make sure the DL gate stays asserted until the throttler runs. */
-	sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
+	mg_set_dl_gate(true);
 
 	start = ktime_get();
 
@@ -631,8 +747,20 @@ static void memguard_write_process_overflow(struct irq_work *entry)
 	local_irq_save(flags);
 	preempt_disable();
 
+#if MEMGUARD_DEBUG_COUNTERS
+	atomic64_inc(&mg_dbg_ovf_write_work_count);
+#endif
+
+	if (!g_enable_write_throttle) {
+		/* Keep gate open if we reached here from an older queued event. */
+		mg_set_dl_gate(false);
+		preempt_enable();
+		local_irq_restore(flags);
+		return;
+	}
+
 	/* Make sure the DL gate stays asserted until the throttler runs. */
-	sched_dl_gate_set_cpu_hard(smp_processor_id(), true);
+	mg_set_dl_gate(true);
 
 	start = ktime_get();
 
@@ -875,7 +1003,7 @@ static void period_timer_callback_slave(struct core_info *cinfo)
 	cinfo->read_event->pmu->start(cinfo->read_event, PERF_EF_RELOAD);
 	cinfo->write_event->pmu->start(cinfo->write_event, PERF_EF_RELOAD);
 
-	sched_dl_gate_set_cpu_hard(smp_processor_id(), false);
+	mg_set_dl_gate(false);
 }
 
 static struct perf_event *init_counter(int cpu, int budget, int counter_id, void *callback)
@@ -964,8 +1092,60 @@ static void __stop_counter(void *info)
 	hrtimer_cancel(&cinfo->hr_timer);
 
 	/* Ensure DL gate is open when stopping the controller. */
-	sched_dl_gate_set_cpu_hard(smp_processor_id(), false);
+	mg_set_dl_gate(false);
 }
+
+#if MEMGUARD_DEBUG_COUNTERS
+static int memguard_debug_stats_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "gate_on_count: %lld\n",
+			(long long)atomic64_read(&mg_dbg_gate_on_count));
+	seq_printf(m, "gate_off_count: %lld\n",
+			(long long)atomic64_read(&mg_dbg_gate_off_count));
+	seq_printf(m, "overflow_read_irq_count: %lld\n",
+			(long long)atomic64_read(&mg_dbg_ovf_read_irq_count));
+	seq_printf(m, "overflow_write_irq_count: %lld\n",
+			(long long)atomic64_read(&mg_dbg_ovf_write_irq_count));
+	seq_printf(m, "overflow_read_work_count: %lld\n",
+			(long long)atomic64_read(&mg_dbg_ovf_read_work_count));
+	seq_printf(m, "overflow_write_work_count: %lld\n",
+			(long long)atomic64_read(&mg_dbg_ovf_write_work_count));
+	seq_printf(m, "throttle_wake_count: %lld\n",
+			(long long)atomic64_read(&mg_dbg_throttle_wake_count));
+	return 0;
+}
+
+static int memguard_debug_stats_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, memguard_debug_stats_show, NULL);
+}
+
+static ssize_t memguard_debug_stats_write(struct file *filp,
+					 const char __user *ubuf,
+					 size_t cnt,
+					 loff_t *ppos)
+{
+	char buf[BUF_SIZE];
+	size_t copy_len = min_t(size_t, cnt, BUF_SIZE - 1);
+
+	if (copy_from_user(buf, ubuf, copy_len) != 0)
+		return -EFAULT;
+
+	buf[copy_len] = '\0';
+	if (!strncmp(buf, "reset", 5))
+		mg_dbg_reset_counters();
+
+	return cnt;
+}
+
+static const struct file_operations memguard_debug_stats_fops = {
+	.open		= memguard_debug_stats_open,
+	.write		= memguard_debug_stats_write,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+#endif
 
 
 /**************************************************************************
@@ -990,6 +1170,8 @@ static ssize_t memguard_control_write(struct file *filp,
 		sscanf(p+8, "%d", &g_use_reclaim);
 	else if (!strncmp(p, "exclusive ", 10))
 		sscanf(p+10, "%d", &g_use_exclusive);
+	else if (!strncmp(p, "edge_gate ", 10))
+		sscanf(p+10, "%d", &g_edge_trigger_dl_gate);
 	else
 		pr_info("ERROR: %s\n", p);
 	return cnt;
@@ -1001,6 +1183,8 @@ static int memguard_control_show(struct seq_file *m, void *v)
 	char buf[BUF_SIZE];
 	seq_printf(m, "reclaim: %d\n", g_use_reclaim);
 	seq_printf(m, "exclusive: %d\n", g_use_exclusive);
+	seq_printf(m, "write_throttle: %d\n", g_enable_write_throttle);
+	seq_printf(m, "edge_gate: %d\n", g_edge_trigger_dl_gate);
 	cpumap_print_to_pagebuf(1, buf, global->active_mask);
 	seq_printf(m, "active: %s\n", buf);
 	cpumap_print_to_pagebuf(1, buf, global->throttle_mask);	
@@ -1282,6 +1466,10 @@ static int memguard_init_debugfs(void)
 
 	debugfs_create_file("usage", 0666, memguard_dir, NULL,
 			    &memguard_usage_fops);
+#if MEMGUARD_DEBUG_COUNTERS
+	debugfs_create_file("debug_stats", 0666, memguard_dir, NULL,
+			    &memguard_debug_stats_fops);
+#endif
 	return 0;
 }
 
@@ -1339,6 +1527,7 @@ int init_module( void )
 	}
 
 	global->period_in_ktime = ktime_set(0, g_period_us * 1000);
+	mg_dbg_reset_counters();
 
 	/* initialize all online cpus to be active */
 	cpumask_copy(global->active_mask, cpu_online_mask);
